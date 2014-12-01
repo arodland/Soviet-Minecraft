@@ -17,6 +17,8 @@ use IO::Async::Process;
 use IO::Async::Stream;
 use IO::Async::Timer::Countdown;
 use Net::Async::HTTP::Server::PSGI;
+use Plack::Request;
+use Plack::Response;
 use curry;
 
 option config_filename => (
