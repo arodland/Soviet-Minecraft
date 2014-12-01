@@ -92,8 +92,8 @@ sub _setup_server {
       qw(java -Xms1024M -Xmx1024M -jar), $self->minecraft_jar, qw(nogui),
     ],
     stdin => { via => 'pipe_write' },
-    stdout => { on_read => $self->_line_reader('got_child_stdout') } },
-    stderr => { on_read => $self->_line_reader('got_child_stderr') } },
+    stdout => { on_read => $self->_line_reader('got_child_stdout') },
+    stderr => { on_read => $self->_line_reader('got_child_stderr') },
     on_finish => $self->curry::got_child_close,
   );
 
@@ -501,11 +501,11 @@ sub got_child_close {
 
   print "pid ", $self->server->pid, " closed all pipes.\n";
 
-  $loop->remove($self->server);
+  $self->loop->remove($self->server);
   $self->clear_server;
-  $loop->remove($self->stdin);
+  $self->loop->remove($self->stdin);
   $self->clear_stdin;
-  $loop->remove($self->httpd);
+  $self->loop->remove($self->httpd);
   $self->clear_httpd;
 
   return;
@@ -519,7 +519,7 @@ sub got_child_signal {
   # May have been reaped by on_child_close()
   return unless $self->server && $self->server->pid == $pid;
 
-  $loop->remove($self->server);
+  $self->loop->remove($self->server);
   $self->clear_server;
 }
 
@@ -528,3 +528,5 @@ sub got_console_stdin {
 
   $self->server->stdin->write("$input\n");
 }
+
+1;
