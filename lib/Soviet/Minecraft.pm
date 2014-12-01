@@ -16,7 +16,7 @@ use IO::Async::Loop;
 use IO::Async::Process;
 use IO::Async::Stream;
 use IO::Async::Timer::Countdown;
-use Net::Async::HTTP::Server;
+use Net::Async::HTTP::Server::PSGI;
 use curry;
 
 option config_filename => (
@@ -74,7 +74,7 @@ sub _line_reader {
   my ($self, $method) = @_;
 
   return sub {
-    my $self = shift;
+    my $stream = shift;
     my ($buffref, $eof) = @_;
 
     while ($$buffref =~ s/^(.*)\n//) {
@@ -111,7 +111,7 @@ sub _setup_stdin {
   my ($self) = @_;
   my $stdin = IO::Async::Stream->new(
     read_handle => \*STDIN,
-    write_handler => \*STDERR, # never used
+    write_handle => \*STDERR, # never used
     on_read => $self->_line_reader('got_console_stdin'),
   );
 
@@ -131,7 +131,7 @@ has httpd_port => (is => 'ro', lazy => 1, default => sub { 8181 });
 sub _build_httpd {
   my ($self) = @_;
 
-  my $server = Net::Async::Server::HTTP::PSGI->new(
+  my $server = Net::Async::HTTP::Server::PSGI->new(
     app => sub {
       my $env = shift;
       my $req = Plack::Request->new($env);
