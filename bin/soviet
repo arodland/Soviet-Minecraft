@@ -4,15 +4,5 @@ use warnings;
 # PODNAME: soviet
 # ABSTRACT: a Minecraft launcher
 
-use Getopt::Long::Descriptive;
 use Soviet::Minecraft;
-
-my ($opt, $usage) = describe_options(
-  '%c %o',
-  [ 'config|c=s', 'config filename' ],
-);
-
-my $soviet = Soviet::Minecraft->new({
-  ($opt->config ? (config_filename => $opt->config) : ()),
-});
-POE::Kernel->run;
+Soviet::Minecraft->new_with_options->run;

@@ -4,19 +4,27 @@ use warnings;
 package Soviet::Minecraft;
 # ABSTRACT: in Soviet Minecraft, server op you!
 
-use MooseX::POE;
+use Moo;
+use MooX::Options;
 
 use HTTP::Body;
 use JSON;
 use List::Util qw(max);
 use Path::Tiny;
-use POE::Component::Server::SimpleHTTP;
-use POE::Wheel::Run;
-use POE::Wheel::ReadWrite;
+use IO::Async;
+use IO::Async::Loop;
+use IO::Async::Process;
+use IO::Async::Stream;
+use IO::Async::Timer::Countdown;
+use Net::Async::HTTP::Server;
+use curry;
 
-has config_filename => (
-  is  => 'ro',
+option config_filename => (
+  is => 'ro',
   default => 'soviet.json',
+  format => 's',
+  short => 'c',
+  doc => 'config filename',
 );
 
 has json => (
@@ -34,12 +42,18 @@ has config => (
   },
 );
 
-event save_config => sub {
-  my ($self) = @_[OBJECT,];
+sub save_config {
+  my ($self) = @_;
   path($self->config_filename)->spew_raw(
     $self->json->encode( $self->config )
   );
-};
+}
+
+has loop => (
+  is => 'ro',
+  init_arg => undef,
+  default => sub { IO::Async::Loop->new },
+);
 
 has server => (
   is   => 'rw',
@@ -56,40 +70,53 @@ has minecraft_jar => (
   },
 );
 
+sub _line_reader {
+  my ($self, $method) = @_;
+
+  return sub {
+    my $self = shift;
+    my ($buffref, $eof) = @_;
+
+    while ($$buffref =~ s/^(.*)\n//) {
+      $self->$method($1);
+    }
+    return 0;
+  }
+}
+
 sub _setup_server {
   my ($self) = @_;
 
-  my $server = POE::Wheel::Run->new(
-    Program => [
+  my $server = IO::Async::Process->new(
+    command => [
       qw(java -Xms1024M -Xmx1024M -jar), $self->minecraft_jar, qw(nogui),
     ],
-    StdoutEvent  => "got_child_stdout",
-    StderrEvent  => "got_child_stderr",
-    CloseEvent   => "got_child_close",
-
-    StdioFilter  => POE::Filter::Line->new(Literal => "\n"),
+    stdin => { via => 'pipe_write' },
+    stdout => { on_read => $self->_line_reader('got_child_stdout') } },
+    stderr => { on_read => $self->_line_reader('got_child_stderr') } },
+    on_finish => $self->curry::got_child_close,
   );
 
-  $self->server( $server );
-  return;
+  $self->server($server);
+  $self->loop->add($server);
 }
 
 has stdin => (
-  is   => 'rw',
+  is => 'rw',
   init_arg => undef,
-  clearer  => 'clear_stdin',
+  clearer => 'clear_stdin',
 );
 
 sub _setup_stdin {
   my ($self) = @_;
-  my $stdin = POE::Wheel::ReadWrite->new(
-    InputHandle  => *STDIN,
-    OutputHandle => *STDERR, # Never used...
-    InputFilter => POE::Filter::Line->new(Literal => "\n"),
-    InputEvent  => 'got_console_stdin',
+  my $stdin = IO::Async::Stream->new(
+    read_handle => \*STDIN,
+    write_handler => \*STDERR, # never used
+    on_read => $self->_line_reader('got_console_stdin'),
   );
 
   $self->stdin($stdin);
+  $self->loop->add($stdin);
 }
 
 has httpd => (
@@ -99,66 +126,50 @@ has httpd => (
   builder => '_build_httpd',
 );
 
-has httpd_port => (is => 'ro', lazy => 1, default => 8181);
+has httpd_port => (is => 'ro', lazy => 1, default => sub { 8181 });
 
 sub _build_httpd {
   my ($self) = @_;
 
-  POE::Component::Server::SimpleHTTP->new(
-    ALIAS   => 'httpd',
-    ADDRESS => 0,
-    PORT    => $self->httpd_port,
-    HANDLERS => [
-      {
-        DIR => '^/sms$',
-        SESSION => $self->get_session_id,
-        EVENT => '_http_sms',
-      },
-      {
-        DIR => '.*',
-        SESSION => $self->get_session_id,
-        EVENT => '_http_404',
-      },
-    ],
-    HEADERS => { Server => 'Synergy' },
+  my $server = Net::Async::Server::HTTP::PSGI->new(
+    app => sub {
+      my $env = shift;
+      my $req = Plack::Request->new($env);
+      my $res = $req->new_response;
+      $res->header(Server => 'Synergy');
+
+      if ($req->path eq '/sms') {
+        return $self->_http_sms($env, $req, $res);
+      } else {
+        return $self->_http_404($env, $req, $res);
+      }
+    }
   );
+  $self->loop->add($server);
+  $server->listen(
+    addr => { family => 'inet6', socktype => 'stream', port => $self->httpd_port },
+    on_listen_error => sub { die "Cannot listen: $_[-1]" },
+  );
+  return $server;
 }
 
-sub _params_from_req {
-  my ($self, $req) = @_;
-  my $body = HTTP::Body->new(
-    scalar $req->header('Content-Type'),
-    scalar $req->header('Content-Length'),
-  );
-  $body->add( $req->content );
-  return $body->param;
-}
+sub _http_sms {
+  my ($self, $env, $request, $response) = @_;
 
-event _http_sms => sub {
-  my ($kernel, $self, $request, $response, $dirmatch)
-    = @_[ KERNEL, OBJECT, ARG0 .. ARG2 ];
-
-  # Check for errors
-  if (! defined $request) {
-    $kernel->call('httpd', 'DONE', $response );
-    return;
-  }
-
-  my $param = $self->_params_from_req($request);
+  my $param = $request->parameters;
 
   my $from = $param->{From} // '';
   $from =~ s/\A\+1//;
 
   my $sender_ok = $self->config->{allow_sms_from}->{$from};
   unless ($param->{AccountSid} eq $self->config->{twilio_sid} and $sender_ok) {
-    $response->code(400);
-    $response->content("Bad request");
-    $kernel->call( 'httpd', 'DONE', $response );
+    $response->status(400);
+    $response->body('Bad request');
     warn sprintf "Bad request for %s from phone %s from IP %s",
-      $request->uri->path_query,
+      $request->path . '?' . $request->query_string,
       $from,
-      $response->connection->remote_ip;
-    return;
+      $request->address;
+    return $response->finalize;
   }
 
   my $text = lc $param->{Body};
@@ -176,71 +187,68 @@ event _http_sms => sub {
   }
 
   if (defined $reply) {
-    $response->code(200);
-    $response->content($reply);
+    $response->status(200);
+    $response->body($reply);
   } else {
-    $response->code(200);
-    $response->content("Does not compute.");
+    $response->status(200);
+    $response->body("Does not compute.");
   }
 
-  $kernel->call( 'httpd', 'DONE', $response );
-
-  warn("Request from " . $response->connection->remote_ip . " " . $request->uri->path_query);
+  warn("Request from " . $request->address . " " . $request->path . "?" . $request->query_string);
 
   if (defined $reply and length $command) {
-    $self->server->put($command);
-  }
-};
-
-event _http_404 => sub {
-  my ($kernel, $self, $request, $response) = @_[KERNEL, OBJECT, ARG0 .. ARG2];
-
-  if (! defined $request) {
-    $kernel->call('httpd', 'DONE', $response );
-    return;
+    $self->server->stdin->write($command . "\n");
   }
 
-  # Do our stuff to HTTP::Response
+
+  return $response->finalize;
+}
+
+sub _http_404 {
+  my ($self, $env, $request, $response) = @_;
+
   $response->code(404);
   $response->content(
     "Hi visitor from "
-    . $response->connection->remote_ip
+    . $request->address
     . ", Page not found -> '"
-    . $request->uri->path . "'\n\n"
+    . $request->path . "'\n\n"
   );
 
-  # We are done!
-  # For speed, you could use $_[KERNEL]->call( ... )
-  $kernel->call( 'httpd', 'DONE', $response );
   warn
     "Request from "
-    . $response->connection->remote_ip . " " . $request->uri->path_query;
-};
+    . $request->address . " " . $request->path . '?' . $request->query_string;
+}
 
-sub START {
+sub run {
   my ($self) = @_;
   $self->_setup_server;
   $self->_setup_stdin;
 
   $self->httpd;
 
-  POE::Kernel->sig_child($self->server->PID, "got_child_signal");
+  $self->loop->watch_child($self->server->pid, $self->curry::got_child_signal);
 
-  print(
-    "Child pid ", $self->server->PID,
-    " started as wheel ", $self->server->ID, ".\n"
-  );
+  print "Child pid ", $self->server->pid, " started.\n";
+  
+  $self->loop->run;
 }
 
-event got_cast_vote => sub {
-  my ($self, $who, $which, $vote) = @_[OBJECT, ARG0, ARG1, ARG2];
+has election => (
+  is => 'rw',
+  lazy => 1,
+  default => sub { +{} },
+);
 
+sub got_cast_vote {
+  my ($self, $who, $which, $vote) = @_;
+  
   # Election in progress?
   #   YES: add/change vote
   #   NO : Last election very recent?
   #     YES: Complain and refuse.
   #     NO : Begin new election.
-  my $election = ($_[HEAP]{election}{$which} ||= {});
+  my $election = $self->election->{$which} ||= {};
 
   if ($election->{completed_at}) {
     if (
@@ -248,37 +256,42 @@ event got_cast_vote => sub {
       and
       $election->{completed_at} > time - 300
     ) {
-      $self->server->put("msg $who You can't change the $which again so soon!");
+      $self->server->stdin->write("msg $who You can't change the $which again so soon!\n");
       return;
     }
 
-    $election = $_[HEAP]{election}{$which} = {};
+    $election = $self->election->{$which} = {};
   }
 
   if (! $election->{began_at}) {
     $election->{began_at} = time;
-    $_[KERNEL]->delay_set(election_complete => 31, $which);
+    $self->loop->add(
+      IO::Async::Timer::Countdown->new(
+        delay => 31,
+        on_expire => $self->curry::election_complete($which),
+      )
+    );
   }
 
   $election->{votes}{$which} = $vote;
-  $self->server->put("list"); # to trigger early termination
-};
+  $self->server->stdin->write("list\n"); # to trigger early termination
+}
 
-event got_updated_player_count => sub {
-  my ($curr, $max) = @_[ARG0, ARG1];
-  for my $which (keys %{ $_[HEAP]{election} }) {
-    my $votes = values %{ $_[HEAP]{election}{$which}{votes} };
+sub got_updated_player_count {
+  my ($self, $curr, $max) = @_;
+  for my $which (keys %{ $self->election }) {
+    my $votes = values %{ $self->election->{$which}{votes} };
     if ($votes >= $curr) {
-      $_[KERNEL]->yield(election_complete => $which);
+      $self->loop->later( $self->curry::election_complete($which) );
     }
   }
-};
+}
 
-event election_complete => sub {
-  my ($self, $which) = @_[OBJECT,ARG0];
+sub election_complete {
+  my ($self, $which) = @_;
 
-  my $server   = $self->server;
-  my $election = $_[HEAP]{election}{$which};
+  my $server = $self->server;
+  my $election = $self->election->{$which};
 
   if ($election->{completed_at}) {
     # This happens when the on-delay event fires after the election completed
@@ -295,36 +308,42 @@ event election_complete => sub {
   my @ranked = sort { $score{$b} <=> $score{$a} } keys %score;
   if (@votes > 1 && $score{ $ranked[0] } == $score{ $ranked[1] }) {
     # n-way tie, no change?
-    $server->put("say The $which vote was a tie.  Nothing will change.");
+    $server->stdin->write("say The $which vote was a tie.  Nothing will change.\n");
     return;
   }
 
   my $winner = $ranked[0];
 
   if ($which eq 'rain') {
-    if    ($winner eq 'on')   { $server->put("weather rain");    }
-    elsif ($winner eq 'off')  { $server->put("weather clear");   }
-    elsif ($winner eq 'hard') { $server->put("weather thunder"); }
+    if    ($winner eq 'on')   { $server->stdin->write("weather rain\n") }
+    elsif ($winner eq 'off')  { $server->stdin->write("weather clear\n") }
+    elsif ($winner eq 'hard') { $server->stdin->write("weather thunder\n") }
 
   } elsif ($which eq 'time') {
-    if    ($winner eq 'sunrise') { $server->put("time set day"); }
-    elsif ($winner eq 'sunset')  { $server->put("time set night"); }
+    if    ($winner eq 'sunrise') { $server->stdin->write("time set day\n") }
+    elsif ($winner eq 'sunset')  { $server->stdin->write("time set night\n") }
 
   } else {
     warn "don't know how to handle $which election!!";
-  };
-};
+  }
+}
 
-event got_xyz_teleport => sub {
-  my ($who, $tp) = @_[ARG0, ARG1];
+has tp => (
+  is => 'rw',
+  lazy => 1,
+  default => sub { +{} },
+);
 
-  return unless my $callbacks = $_[HEAP]{tp}{$who};
+sub got_xyz_teleport {
+  my ($self, $who, $tp) = @_;
+
+  return unless my $callbacks = $self->tp->{who};
 
   for my $key (keys %$callbacks) {
     my $callback = delete $callbacks->{$key};
     $callback->{code}->(@_) unless time > $callback->{expires_at};
   }
-};
+}
 
 sub hub_xyz {
   my ($self) = @_;
@@ -342,11 +361,10 @@ sub porch_for {
   $self->config->{porch}{$player} || $self->home_for($player);
 }
 
-# Wheel event, including the wheel's ID.
-event got_child_stdout => sub {
-  my ($self, $stdout_line, $wheel_id) = @_[OBJECT, ARG0, ARG1];
+sub got_child_stdout {
+  my ($self, $stdout_line) = @_;
   my $server = $self->server;
-  # print "pid ", $child->PID, " STDOUT: $stdout_line\n";
+  # print "pid ", $self->server->pid, " STDOUT: $stdout_line\n";
   print "$stdout_line\n";
 
   # [11:01:21] [Server thread/INFO]: rjbs joined the game
@@ -354,7 +372,7 @@ event got_child_stdout => sub {
   return unless my $parse = naive_parse($stdout_line);
 
   if (my $tp = tp_parse($parse->{message})) {
-    $_[KERNEL]->yield(got_xyz_teleport => lc $tp->{who}, $tp);
+    $self->loop->later($self->curry::got_xyz_teleport(lc $tp->{who}, $tp));
     return;
   }
 
@@ -362,7 +380,7 @@ event got_child_stdout => sub {
     my ($curr, $max) =
       $parse->{message} =~ m{\AThere are ([0-9]+)/([0-9]+) players}
   ) {
-    $_[KERNEL]->yield(got_updated_player_count => $curr, $max);
+    $self->loop->later($self->curry::got_updated_player_count($curr, $max));
     return;
   }
 
@@ -370,79 +388,78 @@ event got_child_stdout => sub {
     $who  = lc $who;
     $what = lc $what;
 
-    if    ($what eq '!hub')     { $server->put("tp $who " . $self->hub_xyz) }
-    elsif ($what eq '!home')    { $server->put("tp $who " . $self->home_for($who)); }
+    if    ($what eq '!hub')     { $server->stdin->write("tp $who " . $self->hub_xyz) }
+    elsif ($what eq '!home')    { $server->stdin->write("tp $who " . $self->home_for($who)); }
 
-    elsif ($what eq '!set home')  {
-      $_[HEAP]{tp}{$who}{home} = {
+    elsif ($what eq '!set home') {
+      $self->tp->{$who}{home} = {
         expires_at => time + 5,
         code       => sub {
-          my ($self, $tp) = @_[OBJECT,ARG1];
+          my ($self, $tp) = @_;
           $self->config->{home}{$who} = "$tp->{x} $tp->{y} $tp->{z}";
-          $_[KERNEL]->yield('save_config');
-          $server->put("msg $who Your home has been updated.");
+          $self->loop->later( $self->curry::save_config );
+          $server->stdin->write("msg $who Your home has been updated.\n");
         },
       };
       $server->put("tp $who ~ ~ ~");
     }
 
     elsif ($what eq '!set porch')  {
-      $_[HEAP]{tp}{$who}{porch} = {
+      $self->tp->{$who}{porch} = {
         expires_at => time + 5,
         code       => sub {
-          my ($self, $tp) = @_[OBJECT,ARG1];
+          my ($self, $tp) = @_;
           $self->config->{porch}{$who} = "$tp->{x} $tp->{y} $tp->{z}";
-          $_[KERNEL]->yield('save_config');
-          $server->put("msg $who Your front porch location has been updated.");
+          $self->loop->later( $self->curry::save_config );
+          $server->stdin->write("msg $who Your front porch location has been updated.");
         },
       };
-      $server->put("tp $who ~ ~ ~");
     }
 
     elsif ($what eq '!sunrise') {
-      $_[KERNEL]->yield(got_cast_vote => $who, 'time', 'sunrise');
-      $server->put("msg $who You cast your vote for sunrise.");
+      $self->loop->later( $self->curry::got_cast_vote($who, 'time', 'sunrise') );
+      $server->stdin->write("msg $who You cast your vote for sunrsie.");
     }
     elsif ($what eq '!sunset') {
-      $_[KERNEL]->yield(got_cast_vote => $who, 'time', 'sunset');
-      $server->put("msg $who You cast your vote for sunset.");
+      $self->loop->later( $self->curry::got_cast_vote($who, 'time', 'sunset') );
+      $server->stdin->write("msg $who You cast your vote for sunset.");
     }
 
     elsif ($what eq '!rain on') {
-      $_[KERNEL]->yield(got_cast_vote => $who, 'rain', 'on');
-      $server->put("msg $who You cast your vote for rain.");
+      $self->loop->later( $self->curry::got_cast_vote($who, 'rain', 'on') );
+      $server->stdin->write("msg $who You cast your vote for rain.");
     }
     elsif ($what eq '!rain off') {
-      $_[KERNEL]->yield(got_cast_vote => $who, 'rain', 'off');
-      $server->put("msg $who You cast your vote for clear skies.");
+      $self->loop->later( $self->curry::got_cast_vote($who, 'rain', 'off') );
+      $server->stdin->write("msg $who You cast your vote for clear skies.");
     }
     elsif ($what eq '!rain hard') {
-      $_[KERNEL]->yield(got_cast_vote => $who, 'rain', 'hard');
-      $server->put("msg $who You cast your vote for a thunderstorm.");
+      $self->loop->later( $self->curry::got_cast_vote($who, 'rain', 'hard') );
+      $server->stdin->write("msg $who You cast your vote for a thunderstorm.");
     }
 
     elsif ($what =~ /\A!visit (\S+)\z/) {
-      $server->put("tp $who " . $self->porch_for($1));
+      $server->stdin->write("tp $who " . $self->porch_for($1) );
     }
 
     elsif ($what =~ /\A!mode (creative|survival)\z/i) {
-      my $mode = $1 eq 'creative' ? 1 : 0;
-      $server->put("gamemode $mode $who");
+      my $mode = lc($1) eq 'creative' ? 1 : 0;
+      $server->stdin->write("gamemode $mode $who");
     }
 
     elsif ($what =~ /\A!join (\S+)\z/) {
       # If $1 isn't a player, report an error.
-      $server->put("tp $who $1");
+      $server->stdin->write("tp $who $1");
     }
   }
-};
+}
 
 sub tp_parse {
   my ($msg) = @_;
 
   # [22:15:01] [Server thread/INFO]:
   # Teleported rjbs to 688.330745199867, 75.0, 479.96637932110707
-
+  
   my ($who, $x, $y, $z) = $msg =~ /\A
     Teleported \s (\S+) \s to \s
     ([0-9]+\.[0-9]+), \s
@@ -474,49 +491,40 @@ sub naive_parse {
   };
 }
 
-# Wheel event, including the wheel's ID.
-event got_child_stderr => sub {
-  my ($stderr_line, $wheel_id) = @_[ARG0, ARG1];
-  my $child = $_[HEAP]{child};
-  # print "pid ", $child->PID, " STDERR: $stderr_line\n";
+sub got_child_stderr {
+  my ($self, $stderr_line) = @_;
   warn "$stderr_line\n";
-};
+}
 
-# Wheel event, including the wheel's ID.
-event got_child_close => sub {
-  my ($self, $wheel_id) = @_[OBJECT, ARG0];
+sub got_child_close {
+  my ($self) = @_;
 
-  my $server = $self->server;
+  print "pid ", $self->server->pid, " closed all pipes.\n";
 
-  unless ($wheel_id == $server->ID) {
-    die "what's going on!? child closed, but it isn't the server!";
-  }
-
-  print "pid ", $server->PID, " closed all pipes.\n";
-
+  $loop->remove($self->server);
   $self->clear_server;
+  $loop->remove($self->stdin);
   $self->clear_stdin;
-  $_[KERNEL]->call('httpd', 'SHUTDOWN');
+  $loop->remove($self->httpd);
   $self->clear_httpd;
+
   return;
-};
+}
 
-event got_child_signal => sub {
-  my ($self) = @_[OBJECT,];
-  print "pid $_[ARG1] exited with status $_[ARG2].\n";
+sub got_child_signal {
+  my ($self, $pid, $code) = @_;
 
-  # May have been reaped by on_child_close().
-  return unless $self->server && $self->server->PID == $_[ARG1];
+  print "PID $pid exited with status $code.\n";
 
+  # May have been reaped by on_child_close()
+  return unless $self->server && $self->server->pid == $pid;
+
+  $loop->remove($self->server);
   $self->clear_server;
-};
+}
 
-event got_console_stdin => sub {
-  my ($self, $input) = @_[OBJECT, ARG0];
+sub got_console_stdin {
+  my ($self, $input) = @_;
 
-  chomp $input;
-
-  $self->server->put($input);
-};
-
-1;
+  $self->server->stdin->write("$input\n");
+}
