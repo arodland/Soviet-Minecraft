@@ -227,7 +227,7 @@ sub run {
 
   $self->httpd;
 
-  $self->loop->watch_child($self->server->pid, $self->curry::got_child_signal);
+#  $self->loop->watch_child($self->server->pid, $self->curry::got_child_signal);
 
   print "Child pid ", $self->server->pid, " started.\n";
   
