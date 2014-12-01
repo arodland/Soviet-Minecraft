@@ -220,6 +220,8 @@ sub _http_404 {
   warn
     "Request from "
     . $request->address . " " . $request->path . '?' . $request->query_string;
+
+  return $response->finalize;
 }
 
 sub run {
