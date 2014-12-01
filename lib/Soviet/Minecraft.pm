@@ -5,6 +5,7 @@ package Soviet::Minecraft;
 # ABSTRACT: in Soviet Minecraft, server op you!
 
 use Moo;
+use warnings NONFATAL => 'all';
 use MooX::Options;
 
 use HTTP::Body;
